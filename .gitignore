@@ -1,0 +1,55 @@
+node_modules/
+dist/
+release/
+stage/
+*.log
+.DS_Store
+.env
+.env.*
+!.env.example
+*.tsbuildinfo
+
+# Dev artifacts
+test-screenshots/
+extension-key.pem
+screenshot-*.png
+copilot-test-*.txt
+*-stderr.log
+*-stdout.log
+
+# Bundled runtime fetched at dist time
+build-resources/
+
+# Editor / OS
+.vscode/
+.idea/
+*.swp
+Thumbs.db
+
+# Local plans / notes / scratch — never check in. Pre-public audit.
+plan.md
+PLAN.md
+TODO.md
+TODOS.md
+NOTES.md
+SCRATCH.md
+WIP.md
+DRAFT.md
+DEMO_SCRIPT.md
+SCREENSHOT_SHOTLIST.md
+*-architecture.md
+.copilot/
+.session/
+*.local.md
+
+# Build/render caches
+.cache/
+
+
+marketing/cws/
+marketing/video/
+
+# Demo video binaries (re-renderable from scripts/build-demo-video*.mjs).
+*.mp4
+*.mov
+*.webm

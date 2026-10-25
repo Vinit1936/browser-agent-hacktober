@@ -1,0 +1,711 @@
+// Browy Core Runner — transport-agnostic session manager.
+//
+// One Runner instance per process. Multiple Transports attach to it
+// (WebSocket, native messaging stdio, in-process for tests). The Runner
+// dispatches incoming ClientMessages to the underlying Agent and translates
+// Agent events back into ServerMessages routed to the right transport.
+//
+// Phase A scope:
+//   - Single shared Agent (existing playwright-driven one). Multi-Agent
+//     (per-session BrowserToolContext) comes in Phase E.
+//   - One in-flight chat at a time across all transports. Sufficient for
+//     v0.3 since a user is one human pressing one Enter at a time.
+//   - Capability negotiation is recorded but not yet enforced on tools
+//     (that gates tool registry filtering, also Phase E).
+
+import type { Agent } from './loop.js';
+import { ExtensionContext } from './extension-context.js';
+import { WakeWatch } from './wake-watch.js';
+import type {
+  Transport,
+  ClientMessage,
+  ServerMessage,
+  Capability,
+  SessionStart,
+  CdpDetached,
+  InterruptReason,
+} from '../protocol.js';
+import { PROTOCOL_VERSION } from '../protocol.js';
+import type { WSMessage } from '../types.js';
+
+/** What the panel says when a turn is cut short. The text goes in chat.done,
+ *  so panels from before these notes existed show it too. */
+export const INTERRUPT_NOTES: Record<InterruptReason, string> = {
+  sleep: 'Your computer went to sleep during this task, so I stopped it. The chat is saved. Say continue to pick up where it left off.',
+  copilot: 'Copilot quit unexpectedly, so this task stopped. The chat is saved. Send a message to carry on.',
+};
+const SLEPT_IN_LINE_NOTE = "Your computer went to sleep before this task started, so it didn't run. Send it again when you're ready.";
+
+/** The turn's text with the note after it, in italics like the Stop note. */
+function withNote(text: string, note: string): string {
+  return `${text ? `${text}\n\n` : ''}_${note}_`;
+}
+
+interface SessionState {
+  id: string;
+  transport: Transport;
+  capabilities: Set<Capability>;
+  /** Set true while a chat is in flight; prevents overlapping requests. */
+  inFlight: boolean;
+  /** Phase E: present when session declared cdp.activeTab. */
+  extContext?: ExtensionContext;
+}
+
+/** The chat the agent is running. `released` means Stop freed its panel
+ *  before agent.chat() returned, so its eventual result is dropped. */
+interface CurrentTurn {
+  sessionId: string;
+  settled: boolean;
+  released: boolean;
+  interrupted?: InterruptReason;
+}
+
+export interface RunnerOptions {
+  serverVersion: string;
+  /** Probe + sign-in handlers — kept transport-agnostic so any frontend can
+   *  trigger them. Implementations live in cli.ts (own credential store
+   *  knowledge) for now. */
+  authProbe?: () => 'ready' | 'unauth' | 'unknown';
+  authSignin?: () => boolean;
+  /** How long a turn may hold the panel after Stop before the runner frees
+   *  it anyway. Default 3 s; tests shorten it. */
+  stopGraceMs?: number;
+  /** Notices sleeps. Default: a 5 s timer that calls more than 30 s a
+   *  sleep. Tests pass their own, or false for none. */
+  wakeWatch?: WakeWatch | false;
+}
+
+export class Runner {
+  private agent: Agent;
+  private opts: RunnerOptions;
+
+  /** sessionId → SessionState. Survives only as long as the transport. */
+  private sessions = new Map<string, SessionState>();
+
+  /** Transport.id → set of session ids hosted on it (for cleanup). */
+  private transportSessions = new Map<string, Set<string>>();
+
+  /** The session currently driving the Agent. Used to route activity
+   *  events back to the originator. */
+  private activeSessionId: string | null = null;
+
+  /** Chats sent from other panels while the agent was busy, oldest first.
+   *  Until 0.1.11 they were refused with "agent is busy on another panel",
+   *  and the user had to notice and send the message again. */
+  private waiting: Array<{ sessionId: string; text: string }> = [];
+
+  /** The chat the agent is running. `released` means Stop freed its panel
+   *  before agent.chat() returned, so its eventual result is dropped. */
+  private currentTurn: CurrentTurn | null = null;
+
+  /** Latched Copilot SDK readiness, replayed to clients that attach late. */
+  private sdkReady: { ok: boolean; detail?: string } | null = null;
+
+  constructor(agent: Agent, opts: RunnerOptions) {
+    this.agent = agent;
+    this.opts = opts;
+
+    // Subscribe to agent activity ONCE. Route every event to the active
+    // session (chat-scoped events) AND broadcast to all sessions
+    // (status/tabs/models — UI-wide concerns).
+    this.agent.setActivityCallback((wsMsg) => this.onAgentEvent(wsMsg));
+
+    if (opts.wakeWatch !== false) {
+      const wake = opts.wakeWatch ?? new WakeWatch().start();
+      wake.onWake((gapMs) => this.onWake(gapMs));
+      this.agent.setWakeWatch?.(wake);
+    }
+  }
+
+  // ── Transport lifecycle ─────────────────────────────────────────────────
+
+  attach(transport: Transport): void {
+    this.transportSessions.set(transport.id, new Set());
+
+    transport.onMessage((msg) => {
+      this.handleClientMessage(transport, msg).catch((err) => {
+        const sid = (msg as any).sessionId;
+        if (sid) {
+          transport.send({
+            type: 'chat.error',
+            sessionId: sid,
+            message: err instanceof Error ? err.message : String(err),
+            code: 'internal',
+          });
+        }
+      });
+    });
+
+    transport.onClose(() => {
+      const ids = this.transportSessions.get(transport.id);
+      if (ids) {
+        for (const id of ids) this.closeSession(id, 'transport closed');
+        this.transportSessions.delete(transport.id);
+      }
+    });
+  }
+
+  /** Forget a session whose panel has gone. If it was mid-turn, stop the
+   *  turn: nobody can see it any more, and its browser calls would be routed
+   *  to a context that no longer exists. */
+  private closeSession(id: string, reason: string): void {
+    this.waiting = this.waiting.filter((w) => w.sessionId !== id);
+    if (this.activeSessionId === id) void this.agent.abort().catch(() => {});
+    this.sessions.get(id)?.extContext?.dispose(reason);
+    this.sessions.delete(id);
+  }
+
+  /** Start the oldest waiting chat whose panel is still open. */
+  private runNextWaiting(): void {
+    while (this.waiting.length) {
+      const next = this.waiting.shift()!;
+      if (!this.sessions.has(next.sessionId)) continue;
+      void this.onChatSend(next.sessionId, next.text).catch(() => {});
+      return;
+    }
+  }
+
+  /** Free the panel of a turn that ignored Stop. Its result, if it ever
+   *  comes, is dropped (see onChatSend). */
+  private releaseStuckTurn(turn: CurrentTurn | null): void {
+    if (!turn || turn.settled || turn.released || this.currentTurn !== turn) return;
+    turn.released = true;
+    console.log(`  ■ chat ${turn.sessionId}: still running ${(this.opts.stopGraceMs ?? 3000) / 1000} s after Stop; freeing the panel`);
+    const s = this.sessions.get(turn.sessionId);
+    const note = turn.interrupted ? INTERRUPT_NOTES[turn.interrupted] : '';
+    s?.transport.send({ type: 'event.activity', sessionId: turn.sessionId, event: 'status.idle' });
+    s?.transport.send({
+      type: 'chat.done', sessionId: turn.sessionId, text: note ? withNote('', note) : '', toolCalls: [], stopped: true,
+      ...(turn.interrupted ? { interrupted: turn.interrupted } : {}),
+    });
+    if (s) s.inFlight = false;
+    if (this.activeSessionId === turn.sessionId) this.activeSessionId = null;
+    this.currentTurn = null;
+    this.runNextWaiting();
+  }
+
+  /** End the running turn the way Stop does, for a reason the panel is told:
+   *  the computer slept, or the Copilot runtime quit. */
+  private interruptTurn(reason: InterruptReason): void {
+    const turn = this.currentTurn;
+    if (!turn || turn.settled || turn.released) return;
+    turn.interrupted ??= reason;
+    console.log(`  ■ chat ${turn.sessionId}: stopping it, ${reason === 'sleep' ? 'the computer slept' : 'Copilot quit'}`);
+    void this.agent.interrupt(reason).catch(() => {});
+    this.sessions.get(turn.sessionId)?.extContext?.cancelPending(INTERRUPT_NOTES[reason]);
+    setTimeout(() => this.releaseStuckTurn(turn), this.opts.stopGraceMs ?? 3000);
+  }
+
+  /** The computer slept (or this process was frozen) for `gapMs`. Whatever
+   *  was running stops, and nothing waiting starts by itself: a task left
+   *  mid-way may have been submitting or sending something, and repeating
+   *  that unasked could do it twice. */
+  private onWake(gapMs: number): void {
+    console.log(`  💤 ${Math.round(gapMs / 1000)} s went by without this process running: the computer slept or the process was paused`);
+    for (const w of this.waiting.splice(0)) {
+      const s = this.sessions.get(w.sessionId);
+      s?.transport.send({ type: 'event.activity', sessionId: w.sessionId, event: 'status.idle' });
+      s?.transport.send({
+        type: 'chat.done', sessionId: w.sessionId, text: withNote('', SLEPT_IN_LINE_NOTE), toolCalls: [], stopped: true, interrupted: 'sleep',
+      });
+    }
+    this.interruptTurn('sleep');
+    // Network connections rarely survive a sleep. Check the one to Copilot
+    // now rather than on the next message.
+    void this.agent.checkCopilot?.().catch(() => {});
+  }
+
+  // ── Inbound dispatch ─────────────────────────────────────────────────────
+
+  private async handleClientMessage(transport: Transport, msg: ClientMessage): Promise<void> {
+    switch (msg.type) {
+      case 'hello':
+        transport.send({
+          type: 'hello.ack',
+          protocol: PROTOCOL_VERSION,
+          serverVersion: this.opts.serverVersion,
+        });
+        return;
+
+      case 'session.start':
+        return this.onSessionStart(transport, msg);
+
+      case 'session.end': {
+        this.closeSession(msg.sessionId, 'session.end');
+        this.transportSessions.get(transport.id)?.delete(msg.sessionId);
+        return;
+      }
+
+      case 'chat.send':
+        return this.onChatSend(msg.sessionId, msg.text, transport);
+
+      case 'chat.cancel': {
+        const sid = (msg as any).sessionId;
+        // A chat still waiting its turn is simply taken out of the line.
+        const before = this.waiting.length;
+        this.waiting = this.waiting.filter((w) => w.sessionId !== sid);
+        if (this.waiting.length !== before) {
+          const s = this.sessions.get(sid);
+          s?.transport.send({ type: 'event.activity', sessionId: sid, event: 'status.idle' });
+          s?.transport.send({ type: 'chat.done', sessionId: sid, text: '', toolCalls: [], stopped: true });
+          return;
+        }
+        // Only the session driving the agent can stop it. Otherwise one
+        // panel could abort another panel's stream.
+        if (this.activeSessionId && this.activeSessionId === sid) {
+          const turn = this.currentTurn;
+          const stopping = this.agent.abort();
+          // Release any browser call the turn was waiting on; the SDK abort
+          // has already been requested, so the turn does not carry on.
+          this.sessions.get(sid)?.extContext?.cancelPending('Stopped by the user.');
+          // Normally the turn ends within a second. If it is stuck somewhere
+          // Stop can't reach, free the panel anyway: until 0.1.13 that meant
+          // reloading the extension.
+          setTimeout(() => this.releaseStuckTurn(turn), this.opts.stopGraceMs ?? 3000);
+          await stopping;
+        }
+        return;
+      }
+
+      case 'history.clear': {
+        // Refuse if another session has a chat in flight — clearing rebinds
+        // the agent's session id, which would abort their stream mid-flight.
+        const callerSid = (msg as any).sessionId;
+        if (this.activeSessionId && this.activeSessionId !== callerSid) {
+          const s = this.sessions.get(callerSid);
+          s?.transport.send({
+            type: 'chat.error', sessionId: callerSid, code: 'busy',
+            message: 'agent is busy on another session — try again in a moment',
+          });
+          return;
+        }
+        if (callerSid) {
+          this.agent.setBrowyProtocolSessionId(callerSid);
+        }
+        await this.agent.clearHistory();
+        return;
+      }
+
+      case 'auth.signin': {
+        if (this.opts.authSignin) {
+          const opened = this.opts.authSignin();          // Re-probe AFTER opening the terminal. If the user was already
+          // signed in (common — the button is reachable even when banner is
+          // momentarily wrong) we must NOT flip state to unauth, otherwise
+          // we'd plant a permanent false banner with no poller to clear it.
+          const state = this.opts.authProbe ? this.opts.authProbe() : 'unknown';
+          if (state === 'ready') {
+            this.broadcast({ type: 'auth.status', state: 'ready' });
+          } else {
+            this.broadcast({
+              type: 'auth.status',
+              state: opened ? 'unauth' : 'unknown',
+              detail: opened
+                ? 'complete sign-in in the terminal window. status will update automatically.'
+                : 'could not open a terminal — run `copilot` from any shell to sign in.',
+            });
+          }
+        }
+        return;
+      }
+
+      case 'models.list': {
+        const models = await this.agent.listModels();
+        transport.send({ type: 'models.list', models });
+        return;
+      }
+
+      case 'models.set':
+        await this.agent.setModel(msg.id);
+        this.broadcast({ type: 'models.current', id: this.agent.getModel() });
+        return;
+
+      case 'chat.list': {
+        const route = this.replyRoute(msg);
+        try {
+          if (msg.progressive) {
+            const chats = await this.agent.listChats((fast) => {
+              transport.send({ type: 'chat.list.result', chats: fast, complete: false, ...route });
+            });
+            transport.send({ type: 'chat.list.result', chats, complete: true, ...route });
+          } else {
+            const chats = await this.agent.listChats();
+            transport.send({ type: 'chat.list.result', chats, ...route });
+          }
+        } catch (e) {
+          transport.send({ type: 'chat.list.result', chats: [], complete: true, error: e instanceof Error ? e.message : String(e), ...route });
+        }
+        return;
+      }
+
+      case 'chat.history': {
+        const route = this.replyRoute(msg);
+        try {
+          if (msg.items) {
+            const page = await this.agent.getHistory(String(msg.id || ''), { limit: msg.limit, before: msg.before });
+            transport.send({ type: 'chat.history.result', id: msg.id, ...page, ...route });
+          } else {
+            const messages = await this.agent.getChatMessages(msg.id);
+            transport.send({ type: 'chat.history.result', id: msg.id, messages, ...route });
+          }
+        } catch (e) {
+          const error = e instanceof Error ? e.message : String(e);
+          transport.send({ type: 'chat.history.result', id: msg.id, ...(msg.items ? { items: [] } : { messages: [] }), error, ...route });
+        }
+        return;
+      }
+
+      case 'chat.delete': {
+        // Refuse only while the agent is mid-turn on the chat being deleted —
+        // deleting a different, idle chat is always safe.
+        if (this.activeSessionId && this.activeSessionId === msg.id) {
+          transport.send({ type: 'chat.delete.result', id: msg.id, ok: false });
+          return;
+        }
+        const ok = await this.agent.deleteChat(msg.id);
+        transport.send({ type: 'chat.delete.result', id: msg.id, ok });
+        return;
+      }
+
+      case 'tool.result': {
+        const s = this.sessions.get((msg as any).sessionId);
+        s?.extContext?.handleToolResult(msg);
+        return;
+      }
+      case 'cdp.event': {
+        const s = this.sessions.get((msg as any).sessionId);
+        s?.extContext?.handleCdpEvent(msg);
+        return;
+      }
+      case 'cdp.detached': {
+        const s = this.sessions.get(msg.sessionId);
+        console.log(`  ⚠ chat ${msg.sessionId}: the debugger came off tab ${msg.tabId} (${msg.reason}${msg.tabGone ? ', tab closed' : ''})`);
+        s?.extContext?.handleDetached(msg as CdpDetached);
+        return;
+      }
+    }
+  }
+
+  /** Where a chat.list / chat.history reply goes. A 0.1.14 side panel names
+   *  its own session, so the reply reaches that panel alone; anything else
+   *  is broadcast to every panel, as before, and the request id lets a panel
+   *  pick out its own replies. A session this host doesn't know (already
+   *  ended) is not used for routing, or the reply would be dropped. */
+  private replyRoute(msg: { reqId?: unknown; sessionId?: unknown }): { reqId?: string; sessionId?: string } {
+    const route: { reqId?: string; sessionId?: string } = {};
+    if (typeof msg.reqId === 'string' && msg.reqId) route.reqId = msg.reqId.slice(0, 64);
+    if (typeof msg.sessionId === 'string' && this.sessions.has(msg.sessionId)) route.sessionId = msg.sessionId;
+    return route;
+  }
+
+  private async onSessionStart(transport: Transport, msg: SessionStart): Promise<void> {
+    const state: SessionState = {
+      id: msg.sessionId,
+      transport,
+      capabilities: new Set(msg.capabilities),
+      inFlight: false,
+    };
+
+    // Phase E: if the client can drive an active tab via CDP, build the
+    // extension context. Tools will be routed through it on chat.send.
+    if (state.capabilities.has('cdp.activeTab')) {
+      state.extContext = new ExtensionContext(msg.sessionId, transport);
+    }
+
+    this.sessions.set(msg.sessionId, state);
+    this.transportSessions.get(transport.id)?.add(msg.sessionId);
+
+    // Apply user's per-tool toggles BEFORE the next ensureSession() runs.
+    // Empty list = no overrides; presence of names means user has disabled
+    // them via the extension Settings page.
+    if (msg.disabledTools !== undefined) {
+      this.agent.setDisabledTools(msg.disabledTools);
+    }
+    if (msg.enabledHostTools !== undefined) {
+      this.agent.setEnabledHostTools(msg.enabledHostTools);
+    }
+
+    transport.send({
+      type: 'session.ready',
+      sessionId: msg.sessionId,
+      model: this.agent.getModel(),
+      capabilities: Array.from(state.capabilities),
+    });
+
+    // Push initial state so the new client renders without waiting for a tick.
+    this.pushInitialState(transport);
+  }
+
+  private pushInitialState(transport: Transport): void {
+    if (this.opts.authProbe) {
+      transport.send({ type: 'auth.status', state: this.opts.authProbe() });
+    }
+    // Replay latched SDK readiness so a panel attaching after boot doesn't
+    // sit waiting for an event that already fired.
+    if (this.sdkReady) {
+      transport.send({ type: 'sdk.ready', ok: this.sdkReady.ok, detail: this.sdkReady.detail });
+    }
+    transport.send({ type: 'models.current', id: this.agent.getModel() });
+    // Only fetch models once the SDK is actually up. Before that listModels()
+    // either returns [] or resolves at the same moment as the post-init
+    // broadcast, which produced two identical models.list payloads on every
+    // cold start.
+    if (!this.sdkReady) return;
+    this.agent.listModels().then((models) => {
+      try { transport.send({ type: 'models.list', models }); } catch {}
+    }).catch(() => {});
+  }
+
+  private async onChatSend(sessionId: string, text: string, transport?: Transport): Promise<void> {
+    const session = this.sessions.get(sessionId);
+    if (!session) {
+      // Until 0.1.13 this dropped the message without a word, and the panel
+      // waited forever. Say so; the side panel registers again and resends.
+      console.log(`  ▶ chat ${sessionId}: no such session on this host, so the panel is told to reconnect`);
+      transport?.send({
+        type: 'chat.error', sessionId, code: 'no_session',
+        message: "Browy's backend lost track of this chat. Reconnect and send the message again.",
+      });
+      return;
+    }
+    if (session.inFlight) {
+      session.transport.send({
+        type: 'chat.error', sessionId, code: 'aborted',
+        message: 'another chat is already in flight on this session',
+      });
+      return;
+    }
+    // Single-Agent serialization: never start a chat while ANOTHER session is
+    // driving the agent. Calling agent.chat() from B while A is mid-stream
+    // would (a) re-bind the SDK session id mid-run and abort A's stream, and
+    // (b) misroute A's deltas to B because activeSessionId would have
+    // flipped. B waits in line instead and starts as soon as A ends.
+    if (this.activeSessionId && this.activeSessionId !== sessionId) {
+      if (this.waiting.some((w) => w.sessionId === sessionId)) {
+        session.transport.send({
+          type: 'chat.error', sessionId, code: 'busy',
+          message: 'this chat already has a message waiting to run',
+        });
+        return;
+      }
+      this.waiting.push({ sessionId, text });
+      session.transport.send({ type: 'chat.queued', sessionId, position: this.waiting.length });
+      console.log(`  ▶ chat ${sessionId}: waiting behind ${this.activeSessionId} (position ${this.waiting.length})`);
+      return;
+    }
+    session.inFlight = true;
+    this.activeSessionId = sessionId;
+    const turn: CurrentTurn = { sessionId, settled: false, released: false };
+    this.currentTurn = turn;
+    const t0 = Date.now();
+    console.log(`  ▶ chat ${sessionId}: started`);
+    // Bind the agent's Copilot SDK session to this protocol id so reloads
+    // resume the same on-disk conversation.
+    this.agent.setBrowyProtocolSessionId(sessionId);
+    // Phase E: swap the agent's tool context to this session's. Single-Agent
+    // shared across sessions is fine for v0.3 because we serialize chats.
+    if (session.extContext) {
+      session.extContext.beginTurn();
+      this.agent.setBrowserContextOverride(session.extContext.build());
+    } else {
+      this.agent.setBrowserContextOverride(null);
+    }
+    let outcome = 'done';
+    try {
+      const result = await this.agent.chat(text);
+      const { text: response, toolCalls, stopped } = result;
+      turn.settled = true;
+      // Stop already freed the panel; this late result belongs to nobody.
+      if (turn.released) return;
+      const interrupted = result.interrupted ?? (stopped ? turn.interrupted : undefined);
+      if (interrupted) {
+        outcome = `stopped (${interrupted === 'sleep' ? 'the computer slept' : 'Copilot quit'})`;
+        // Browser calls the cut-short turn started have nobody to answer.
+        session.extContext?.cancelPending(INTERRUPT_NOTES[interrupted]);
+        session.transport.send({
+          type: 'chat.done', sessionId, text: withNote(response, INTERRUPT_NOTES[interrupted]), toolCalls, stopped: true, interrupted,
+        });
+        return;
+      }
+      if (stopped) outcome = 'stopped';
+      session.transport.send({ type: 'chat.done', sessionId, text: response, toolCalls, ...(stopped ? { stopped } : {}) });
+    } catch (err) {
+      turn.settled = true;
+      if (turn.released) return;
+      outcome = 'error';
+      const m = err instanceof Error ? err.message : String(err);
+      const code = looksLikeAuthError(m) ? 'auth' : 'internal';
+      session.transport.send({ type: 'chat.error', sessionId, message: m, code });
+      if (code === 'auth') {
+        this.broadcast({
+          type: 'auth.status', state: 'unauth',
+          detail: 'github copilot needs sign-in.',
+        });
+      }
+    } finally {
+      turn.settled = true;
+      if (turn.released) {
+        console.log(`  ■ chat ${sessionId}: the turn freed by Stop finally ended after ${Math.round((Date.now() - t0) / 1000)} s`);
+      } else {
+        console.log(`  ■ chat ${sessionId}: ${outcome} in ${Math.round((Date.now() - t0) / 1000)} s`);
+        session.inFlight = false;
+        if (this.activeSessionId === sessionId) this.activeSessionId = null;
+        if (this.currentTurn === turn) this.currentTurn = null;
+        this.runNextWaiting();
+      }
+    }
+  }
+
+  // ── Outbound: translate Agent activity → BrowyProtocol ──────────────────
+
+  private onAgentEvent(ws: WSMessage): void {
+    const translated = translateWsToProtocol(ws, this.activeSessionId);
+    if (!translated) return;
+    if ('sessionId' in translated && translated.sessionId) {
+      // Session-scoped: route to originating session only.
+      const session = this.sessions.get(translated.sessionId as string);
+      session?.transport.send(translated as ServerMessage);
+    } else {
+      // Broadcast: tab / model / browser status events go to all sessions.
+      this.broadcast(translated as ServerMessage);
+    }
+  }
+
+  /** Broadcast to every attached session. Used for global state events. */
+  broadcast(msg: ServerMessage): void {
+    const seen = new Set<string>();
+    for (const s of this.sessions.values()) {
+      if (seen.has(s.transport.id)) continue;
+      seen.add(s.transport.id);
+      try { s.transport.send(msg); } catch {}
+    }
+  }
+
+  /** Notify all sessions of an auth state change (used by external probes). */
+  notifyAuth(state: 'ready' | 'unauth' | 'unknown', detail?: string): void {
+    this.broadcast({ type: 'auth.status', state, detail });
+  }
+
+  /** Record + broadcast Copilot SDK readiness. Kept as state (not just an
+   *  event) so a panel that attaches AFTER the SDK finished booting still
+   *  learns about it via pushInitialState instead of waiting forever. */
+  markSdkReady(ok: boolean, detail?: string): void {
+    this.sdkReady = { ok, detail };
+    this.broadcast({ type: 'sdk.ready', ok, detail });
+  }
+}
+
+// ── Helpers ────────────────────────────────────────────────────────────────
+
+function looksLikeAuthError(m: string): boolean {
+  // Tight regex: must look like an actual authentication failure, not just
+  // any error string that happens to contain the words "sign in". Earlier
+  // we matched /sign\s*in/i which converted many unrelated errors (e.g. a
+  // tool result mentioning a sign-in button) into spurious auth banners.
+  return /\b(?:401|403)\b|unauthori[sz]ed|forbidden|not.*(?:logged|signed).*in|missing.*(?:token|credential)|auth(?:entication)?\s*(?:required|failed|expired)|please\s+(?:log|sign)\s*in/i.test(m);
+}
+
+/**
+ * Translate a legacy WSMessage emitted by Agent into the new BrowyProtocol.
+ * Returns null when the event has no protocol equivalent (yet).
+ *
+ * For session-scoped events we attach the currently-active sessionId.
+ * Broadcast events leave sessionId empty so the runner fans them out.
+ */
+function translateWsToProtocol(
+  ws: WSMessage,
+  activeSessionId: string | null,
+): ServerMessage | null {
+  switch (ws.type) {
+    case 'delta':
+      return activeSessionId
+        ? { type: 'chat.delta', sessionId: activeSessionId, text: ws.text }
+        : null;
+
+    case 'reasoning':
+      return activeSessionId
+        ? {
+            type: 'event.activity',
+            sessionId: activeSessionId,
+            event: 'reasoning',
+            text: ws.text,
+          }
+        : null;
+
+    case 'tool_step':
+      if (!activeSessionId) return null;
+      if (ws.status === 'start') {
+        return {
+          type: 'chat.tool_call',
+          sessionId: activeSessionId,
+          callId: ws.id,
+          tool: ws.name,
+          args: ws.args || {},
+        };
+      }
+      return {
+        type: 'chat.tool_result',
+        sessionId: activeSessionId,
+        callId: ws.id,
+        ok: ws.status === 'end',
+        summary: ws.result,
+        durationMs: ws.durationMs,
+      };
+
+    case 'activity':
+      return activeSessionId
+        ? {
+            type: 'event.activity',
+            sessionId: activeSessionId,
+            event: ws.event,
+            tool: ws.tool,
+            args: ws.args,
+            durationMs: ws.durationMs,
+            inputCount: ws.inputCount,
+          }
+        : null;
+
+    case 'status':
+      return activeSessionId
+        ? {
+            type: 'event.activity',
+            sessionId: activeSessionId,
+            event: `status.${ws.status}`,
+            text: ws.detail,
+          }
+        : null;
+
+    // ── Broadcast (no sessionId — runner fans out to all attached sessions) ──
+    case 'focused_tab':
+      return {
+        type: 'tab.focused',
+        url: ws.url, title: ws.title, brand: ws.brand, tabCount: ws.tabCount,
+      };
+
+    case 'browsers_status':
+      return { type: 'browsers.status', browsers: ws.browsers };
+
+    case 'active_browsers':
+      return { type: 'browsers.active', active: ws.active };
+
+    case 'models_list':
+      return { type: 'models.list', models: ws.models };
+
+    case 'current_model':
+      return { type: 'models.current', id: ws.id };
+
+    case 'copilot_status':
+      return { type: 'auth.status', state: ws.state, detail: ws.detail };
+
+    case 'host_status':
+      return { type: 'host.status', state: ws.state, ...(ws.detail ? { detail: ws.detail } : {}), ...(ws.cause ? { cause: ws.cause } : {}) };
+
+    case 'response':
+      // Agent's "final response" event. chat.done is emitted explicitly by
+      // the runner once agent.chat() resolves, so we suppress this to avoid
+      // double-emit. Kept here as a sentinel comment for future debuggers.
+      return null;
+
+    default:
+      return null;
+  }
+}

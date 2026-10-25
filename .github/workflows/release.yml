@@ -1,0 +1,155 @@
+name: Release
+
+# Builds release artifacts on tag push (v*) and uploads them to the GitHub
+# Release for that tag in THIS repo. Publishing to a separate public repo
+# is intentionally disabled — flip back on when a public distribution
+# channel is decided.
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version (e.g. 0.1.1). Without leading v.'
+        required: true
+
+env:
+  NODE_VERSION: '22'
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    outputs:
+      version: ${{ steps.ver.outputs.version }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+
+      - name: Resolve version
+        id: ver
+        shell: bash
+        run: |
+          if [ -n "${{ inputs.version }}" ]; then
+            echo "version=${{ inputs.version }}" >> $GITHUB_OUTPUT
+          else
+            echo "version=${GITHUB_REF_NAME#v}" >> $GITHUB_OUTPUT
+          fi
+
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm run dist:win
+      - run: npm run pack:extension
+
+      - name: List artifacts
+        shell: bash
+        run: ls -la release/
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: windows-release-${{ steps.ver.outputs.version }}
+          # Sideload zip ships to GH Releases; CWS variant is dev-only
+          # (its `key` is stripped, so sideloading it would assign a
+          # different extension ID and break the native host handshake).
+          path: |
+            release/Browy-*-win-x64.zip
+            release/Browy-Extension-*.zip
+            !release/Browy-Extension-*-cws.zip
+          if-no-files-found: error
+          retention-days: 14
+
+  build-mac:
+    runs-on: macos-latest
+    needs: build-windows
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with: { node-version: '${{ env.NODE_VERSION }}', cache: 'npm' }
+      - run: npm ci
+      - run: npm run dist:mac-x64
+      - run: npm run dist:mac-arm
+      - uses: actions/upload-artifact@v7
+        with:
+          name: mac-release-${{ needs.build-windows.outputs.version }}
+          path: |
+            release/Browy-*-darwin-*.tar.gz
+          if-no-files-found: error
+          retention-days: 14
+
+  build-linux:
+    runs-on: ubuntu-24.04
+    needs: build-windows
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with: { node-version: '${{ env.NODE_VERSION }}', cache: 'npm' }
+      - run: npm ci
+      - run: npm run dist:linux
+      - run: npm run dist:linux-arm
+      - uses: actions/upload-artifact@v7
+        with:
+          name: linux-release-${{ needs.build-windows.outputs.version }}
+          path: |
+            release/Browy-*-linux-*.tar.gz
+          if-no-files-found: error
+          retention-days: 14
+
+  attach-to-release:
+    needs: [build-windows, build-mac, build-linux]
+    runs-on: ubuntu-24.04
+    # Skip on workflow_dispatch — only auto-attach when a real tag was pushed.
+    if: startsWith(github.ref, 'refs/tags/v')
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
+        with:
+          name: windows-release-${{ needs.build-windows.outputs.version }}
+          path: artifacts
+      - uses: actions/download-artifact@v8
+        with:
+          name: mac-release-${{ needs.build-windows.outputs.version }}
+          path: artifacts
+      - uses: actions/download-artifact@v8
+        with:
+          name: linux-release-${{ needs.build-windows.outputs.version }}
+          path: artifacts
+
+      - name: Upload build artifacts to the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.build-windows.outputs.version }}
+        shell: bash
+        run: |
+          set -euxo pipefail
+          TAG="v${VERSION}"
+          # Create the release if it doesn't already exist (first run after a
+          # fresh tag push); reruns hit the upload path. The notes are this
+          # version's CHANGELOG.md section, which is what people watching the
+          # repo's releases get by email.
+          if ! gh release view "$TAG" --repo "${{ github.repository }}" >/dev/null 2>&1; then
+            NOTES="$(mktemp)"
+            if node scripts/release-notes.mjs "$VERSION" > "$NOTES"; then
+              TITLE="$(node scripts/release-notes.mjs "$VERSION" --title)"
+            else
+              TITLE="$TAG"
+              echo "Release $TAG. See [CHANGELOG.md](https://github.com/${{ github.repository }}/blob/main/CHANGELOG.md) for details." > "$NOTES"
+            fi
+            gh release create "$TAG" \
+              --repo "${{ github.repository }}" \
+              --title "$TITLE" \
+              --notes-file "$NOTES"
+          fi
+          # Always also include the install scripts from the source tree
+          # so the GH release has everything a user needs in one place.
+          gh release upload "$TAG" \
+            --repo "${{ github.repository }}" \
+            --clobber \
+            artifacts/* install.ps1 install.sh
+          echo "Uploaded artifacts to ${TAG} → https://github.com/${{ github.repository }}/releases/tag/${TAG}"
