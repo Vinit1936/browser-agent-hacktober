@@ -1,6 +1,6 @@
 // Shared types for BrowserAgent standalone
 
-export type Provider = 'azure' | 'openai' | 'anthropic';
+export type Provider = 'azure' | 'openai' | 'anthropic' | 'deepseek';
 
 export interface CdpEndpoint {
   brand: string;

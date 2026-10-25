@@ -1,4 +1,4 @@
-
+
 // ── winctl shim ─────────────────────────────────────────────────────────
 // The original UI talked to Electron via window.winctl. In the side panel
 // most of these (drag/resize/minimize/close) make no sense — the panel is
@@ -286,7 +286,7 @@ function exportChat() {
     const title = deriveChatTitle(msgs.innerHTML) || 'Untitled chat';
     lines.push('# ' + title);
     lines.push('');
-    lines.push('_Exported from Browy on ' + new Date().toISOString() + '_');
+    lines.push('_Exported from ShinScan AI on ' + new Date().toISOString() + '_');
     lines.push('');
     for (const bub of bubs) {
       const isUser = bub.classList.contains('u');
@@ -295,7 +295,7 @@ function exportChat() {
         lines.push('');
         lines.push((bub.innerText || bub.textContent || '').trim());
       } else {
-        lines.push('## Browy');
+        lines.push('## ShinScan AI');
         lines.push('');
         const reasoning = bub.querySelector('.reasoning');
         if (reasoning) {
@@ -337,7 +337,7 @@ function exportChat() {
     const safeTitle = (title || 'chat').replace(/[\\/:*?"<>|]+/g, '-').slice(0, 40);
     const a = document.createElement('a');
     a.href = url;
-    a.download = `browy-${safeTitle}-${ts}.md`;
+    a.download = `shinscan-${safeTitle}-${ts}.md`;
     document.body.appendChild(a);
     a.click();
     a.remove();
@@ -396,6 +396,7 @@ function browySend(legacy) {
     pendingChat = '';
     lastChatText = legacy.text;
     lastChatResent = false;
+    noteAiRequest(legacy.text);
     browyPost({ type: 'chat.send', sessionId: BROWY_SESSION_ID, text: legacy.text });
   } else if (legacy.type === 'stop') {
     browyPost({ type: 'chat.cancel', sessionId: BROWY_SESSION_ID });
@@ -596,6 +597,7 @@ const wsShim = {
       const legacy = JSON.parse(json);
       if (legacy.type === 'chat' && !sessionReady) {
         // Queue the chat send until the host confirms the session is up.
+        noteAiRequest(legacy.text);
         pendingHostMsgs.push({ type: 'chat.send', sessionId: BROWY_SESSION_ID, text: legacy.text });
         return;
       }
@@ -681,8 +683,8 @@ function setControlsState(state) {
     inp_.style.opacity = typingAllowed ? '' : '0.4';
     inp_.style.cursor = typingAllowed ? '' : 'not-allowed';
     inp_.placeholder = state === 'online' ? ''
-      : state === 'booting' ? 'starting browy backend — you can start typing…'
-      : 'offline — install the browy backend to chat';
+      : state === 'booting' ? 'starting shinscan backend — you can start typing…'
+      : 'offline — install the shinscan backend to chat';
   }
   // Send is allowed while booting (queued), but only with actual text.
   const go = document.getElementById('goBtn');
@@ -706,6 +708,13 @@ function setControlsState(state) {
     chats_.disabled = !typingAllowed;
     chats_.style.opacity = typingAllowed ? '' : '0.4';
     chats_.style.cursor = typingAllowed ? '' : 'not-allowed';
+  }
+  // Status-bar badge mirrors the three boot states.
+  const badge = document.getElementById('stateBadge');
+  if (badge) {
+    badge.textContent = state === 'online' ? 'LIVE' : state === 'booting' ? 'BOOTING' : 'OFFLINE';
+    badge.classList.toggle('live', state === 'online');
+    badge.classList.toggle('booting', state === 'booting');
   }
 }
 
@@ -790,7 +799,7 @@ function renderOnboard() {
   const why = document.getElementById('obWhy');
   if (onboardOs === 'cros') {
     if (title) title.textContent = 'the backend needs windows, macos or linux';
-    if (why) why.textContent = "browy's agent runs as a small program on your computer, and chromeos can't run it yet.";
+    if (why) why.textContent = "shinscan's agent runs as a small program on your computer, and chromeos can't run it yet.";
   } else if (onboardMode === 'stale') {
     if (title) title.textContent = 'update the backend';
     if (why) why.textContent = 'the backend on this computer is too old to talk to this version of the extension. running the installer again updates it in place and keeps your chats.';
@@ -931,7 +940,7 @@ async function offerHostUpdateIfNeeded(protocol) {
   b.dataset.cmd = INSTALL_CMDS[os === 'win' ? 'win' : 'unix'];
   b.dataset.where = os === 'win' ? 'PowerShell' : 'a terminal';
   const t = document.getElementById('updBannerText');
-  if (t) t.textContent = 'browy backend is out of date';
+  if (t) t.textContent = 'shinscan backend is out of date';
   b.classList.add('show');
 }
 function hideHostUpdateBanner() {
@@ -1011,7 +1020,7 @@ function markHostDown() {
   hideHostUpdateBanner();
   try {
     const hint = document.querySelector('#empty .hint');
-    if (hint) hint.textContent = '// offline. check that the browy backend is installed and running';
+    if (hint) hint.textContent = '// offline. check that the shinscan backend is installed and running';
     setControlsState('offline');
     updateTrySuggestions();
     if (typeof closeChatsOverlay === 'function') closeChatsOverlay();
@@ -1026,15 +1035,15 @@ function markHostDown() {
 // Kept to this block so the rest of the panel doesn't need to know.
 const connStatus = (() => {
   const TEXT = {
-    reconnecting: "Browy's backend restarted. Reconnecting…",
-    copilot: 'Copilot quit, so Browy is restarting it…',
-    copilotStalled: 'Copilot stopped answering, so Browy is reconnecting…',
+    reconnecting: "ShinScan's backend restarted. Reconnecting…",
+    copilot: 'Copilot quit, so ShinScan is restarting it…',
+    copilotStalled: 'Copilot stopped answering, so ShinScan is reconnecting…',
     copilotFailed: "Copilot couldn't restart. Send a message to try again.",
     slept: 'Your computer went to sleep, so the task stopped. Say continue to pick it up.',
-    canceled: "You clicked Cancel on Chrome's debugging bar. Ask Browy to try again and it reattaches.",
-    tabGone: 'The tab Browy was working in was closed.',
-    tabBlocked: "The tab went to a page Browy can't work on.",
-    detached: 'Browy lost the tab for a moment. It reattaches on the next step.',
+    canceled: "You clicked Cancel on Chrome's debugging bar. Ask ShinScan to try again and it reattaches.",
+    tabGone: 'The tab ShinScan was working in was closed.',
+    tabBlocked: "The tab went to a page ShinScan can't work on.",
+    detached: 'ShinScan lost the tab for a moment. It reattaches on the next step.',
   };
   const BACKEND_NOTE = '_The backend restarted, so this task stopped. The chat is saved._';
   // Most important first; one line shows at a time.
@@ -1238,7 +1247,7 @@ function connect() {
         // Keep the notice up if this panel asked for the restart.
         if (!restartingHost) hideConnBanner();
         const hint = document.querySelector('#empty .hint');
-        if (hint) hint.textContent = '// starting the browy backend — first run takes a few seconds';
+        if (hint) hint.textContent = '// starting the shinscan backend — first run takes a few seconds';
       } catch {}
       return;
     }
@@ -1491,7 +1500,7 @@ function handle(m) {
     // Another window's chat is running. This one starts when it ends.
     ensureLiveBubble();
     if (liveBody && !liveText) {
-      liveBody.innerHTML = '<span class="note">Browy is working in another window. This starts as soon as that finishes.</span>';
+      liveBody.innerHTML = '<span class="note">ShinScan is working in another window. This starts as soon as that finishes.</span>';
     }
   }
   if (m.type === 'browsers_status') {
@@ -2399,7 +2408,7 @@ function stop() {
     markStopped();
     setBusy(false);
     finalizeLiveBubble();
-    try { showConnBanner("Browy's backend stopped answering, so it's restarting. Send your message again in a few seconds.", { warn: true }); } catch {}
+    try { showConnBanner("ShinScan's backend stopped answering, so it's restarting. Send your message again in a few seconds.", { warn: true }); } catch {}
   }, 10_000);
 }
 
@@ -2955,7 +2964,7 @@ connect = (function (orig) { return orig; })(connect);
   refreshActiveTab();
   // Start in the BOOTING state, not offline — connect() runs immediately and
   // the host is almost always either up or coming up. Starting in 'offline'
-  // flashed "install the browy backend" at users who already have it.
+  // flashed "install the shinscan backend" at users who already have it.
   try { setControlsState('booting'); updateTrySuggestions(); } catch {}
   connect();
   // Waits for the backend, then renders the chat from its session.
@@ -2963,3 +2972,93 @@ connect = (function (orig) { return orig; })(connect);
 })();
 startIdleLoop();
 inp.focus();
+
+// ── ShinScan header controls: mode chips, privacy, AI request counter ──────
+
+// AI requests counter — every chat.send from THIS panel, with a rough payload
+// size (chars sent ≈ bytes; the model's reply isn't counted). Session-scoped:
+// resets when the panel reloads, like the screenshot's "0 · 0 B" baseline.
+let aiReqCount = 0;
+let aiReqBytes = 0;
+function fmtBytes(n) {
+  if (n >= 1024 * 1024) return (n / (1024 * 1024)).toFixed(1) + ' MB';
+  if (n >= 1024) return (n / 1024).toFixed(1) + ' KB';
+  return n + ' B';
+}
+function renderAiReq() {
+  const el = document.getElementById('aiReqBtn');
+  if (el) el.textContent = `AI requests: ${aiReqCount} · ${fmtBytes(aiReqBytes)}`;
+}
+function noteAiRequest(text) {
+  aiReqCount++;
+  aiReqBytes += (text || '').length;
+  renderAiReq();
+}
+const aiReqBtn = document.getElementById('aiReqBtn');
+if (aiReqBtn) {
+  aiReqBtn.addEventListener('click', () => {
+    try { chrome.runtime.openOptionsPage(); } catch {}
+  });
+}
+
+// Cloud / Offline chips. Cloud is the only backend this build has (DeepSeek /
+// OpenRouter / Copilot all run in the cloud backend process); Offline is a
+// placeholder for local models and says so when clicked.
+const cloudChip = document.getElementById('cloudChip');
+const offlineChip = document.getElementById('offlineChip');
+if (offlineChip) {
+  offlineChip.addEventListener('click', () => {
+    offlineChip.classList.remove('shake');
+    void offlineChip.offsetWidth;
+    offlineChip.classList.add('shake');
+  });
+}
+if (cloudChip) {
+  cloudChip.addEventListener('click', () => {
+    cloudChip.classList.add('active');
+  });
+}
+
+// Privacy switch: ON keeps every opt-in host tool (shell, files, run_script)
+// disabled — the agent works inside the browser only. OFF enables them.
+// Writes the same chrome.storage keys the Settings page's per-tool toggles
+// use, and background.js stamps them onto every session.start. Defaults to
+// on, which is also the backend's default.
+const HOST_TOOL_KEYS = ['run_script', 'read_file', 'write_file', 'bash', 'grep', 'glob', 'web_fetch'];
+const privacySel = document.getElementById('privacySel');
+const shieldBtn = document.getElementById('shieldBtn');
+function renderPrivacyUI(on) {
+  if (privacySel) privacySel.value = on ? 'on' : 'off';
+  if (shieldBtn) {
+    shieldBtn.classList.toggle('on', on);
+    shieldBtn.title = on
+      ? 'Privacy on — host tools (shell, files) stay off. Click to enable them.'
+      : 'Privacy off — host tools (shell, files) are enabled. Click to turn them off.';
+  }
+}
+async function setPrivacy(on) {
+  renderPrivacyUI(on);
+  try {
+    const { settings } = await chrome.storage.local.get(['settings']);
+    const tools = { ...((settings && settings.tools) || {}) };
+    for (const k of HOST_TOOL_KEYS) {
+      if (on) delete tools[k];   // omit = disabled (host-tool default)
+      else tools[k] = true;      // explicit opt-in
+    }
+    await chrome.storage.local.set({ settings: { ...(settings || {}), tools } });
+  } catch {}
+}
+if (privacySel) {
+  privacySel.addEventListener('change', () => setPrivacy(privacySel.value === 'on'));
+}
+if (shieldBtn) {
+  shieldBtn.addEventListener('click', () => {
+    const on = privacySel ? privacySel.value !== 'on' : true;
+    setPrivacy(on);
+  });
+}
+chrome.storage.local.get(['settings']).then(({ settings }) => {
+  const tools = (settings && settings.tools) || {};
+  const anyOn = HOST_TOOL_KEYS.some((k) => tools[k] === true);
+  renderPrivacyUI(!anyOn);
+}).catch(() => {});

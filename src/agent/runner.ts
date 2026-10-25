@@ -319,6 +319,45 @@ export class Runner {
         this.broadcast({ type: 'models.current', id: this.agent.getModel() });
         return;
 
+      case 'config.get': {
+        // The API key never travels back — only whether one is set.
+        transport.send({
+          type: 'config.current',
+          provider: this.agent.getProvider(),
+          model: this.agent.getModel(),
+          apiKeySet: this.agent.hasApiKey(),
+        });
+        return;
+      }
+
+      case 'config.set': {
+        try {
+          await this.agent.setLLMConfig(msg);
+        } catch (e) {
+          const m = e instanceof Error ? e.message : String(e);
+          console.log(`  ⚠ config.set failed: ${m}`);
+          this.broadcast({ type: 'auth.status', state: 'unauth', detail: m });
+          return;
+        }
+        this.broadcast({ type: 'models.current', id: this.agent.getModel() });
+        // Switching back to Copilot boots the SDK lazily; say it's ready so
+        // panels start fetching models/chats from it.
+        if (this.agent.getProvider() !== 'deepseek') this.markSdkReady(true);
+        this.agent.listModels().then((models) => {
+          try { this.broadcast({ type: 'models.list', models }); } catch {}
+        }).catch(() => {});
+        if (this.opts.authProbe) {
+          this.broadcast({
+            type: 'auth.status',
+            state: this.opts.authProbe(),
+            ...(this.agent.getProvider() === 'deepseek'
+              ? { detail: this.agent.hasApiKey() ? 'deepseek api key configured' : 'no deepseek api key yet — add it in browy settings' }
+              : {}),
+          });
+        }
+        return;
+      }
+
       case 'chat.list': {
         const route = this.replyRoute(msg);
         try {
@@ -538,7 +577,9 @@ export class Runner {
       if (code === 'auth') {
         this.broadcast({
           type: 'auth.status', state: 'unauth',
-          detail: 'github copilot needs sign-in.',
+          detail: this.agent.getProvider() === 'deepseek'
+            ? 'deepseek rejected the api key — check it in browy settings.'
+            : 'github copilot needs sign-in.',
         });
       }
     } finally {

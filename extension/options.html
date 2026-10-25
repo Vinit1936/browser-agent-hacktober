@@ -2,7 +2,7 @@
 <html>
 <head>
   <meta charset="UTF-8" />
-  <title>Browy — Settings</title>
+  <title>ShinScan AI — Settings</title>
   <style>
     :root {
       --bg:        #0d1310;
@@ -242,7 +242,7 @@
 <body>
   <main>
     <div class="hdr">
-      <div class="brand">▮ BROWY</div>
+      <div class="brand">▮ SHINSCAN AI</div>
       <div class="crumb">// settings</div>
       <div class="ver" id="verLabel">—</div>
     </div>
@@ -297,8 +297,63 @@
 
     <section>
       <div class="sec-hdr">
+        <h2>LLM Provider</h2>
+        <span class="sec-hint">// github copilot (default) or your own deepseek api key</span>
+      </div>
+      <div class="sec-body">
+        <div class="kv" style="margin-bottom:10px">
+          <span class="k">provider</span>
+          <span class="v">
+            <select id="providerSelect" class="search" style="width:100%">
+              <option value="copilot">github copilot — sign-in, models from your account</option>
+              <option value="deepseek">deepseek — bring your own api key</option>
+            </select>
+          </span>
+        </div>
+        <div id="deepseekFields" style="display:none">
+          <div class="kv" style="margin-bottom:10px">
+            <span class="k">api key</span>
+            <span class="v">
+              <input id="deepseekKey" class="search" type="password" style="width:100%"
+                     placeholder="sk-…" autocomplete="off" spellcheck="false" />
+            </span>
+          </div>
+          <div class="kv" style="margin-bottom:10px">
+            <span class="k">model</span>
+            <span class="v">
+              <select id="deepseekModel" class="search" style="width:100%">
+                <option value="deepseek-chat">deepseek-chat — fast, tool-calling</option>
+                <option value="deepseek-reasoner">deepseek-reasoner — slower, deeper reasoning</option>
+                <option value="deepseek/deepseek-v4.1-flash">deepseek/deepseek-v4.1-flash — 1M ctx, via openrouter</option>
+                <option value="deepseek/deepseek-v4.1-flash-1017">deepseek/deepseek-v4.1-flash-1017 — 1M ctx, via openrouter</option>
+              </select>
+            </span>
+          </div>
+          <div class="kv" style="margin-bottom:10px">
+            <span class="k">custom model</span>
+            <span class="v" style="display:flex;gap:6px">
+              <input id="deepseekCustomModel" class="search" type="text" style="flex:1;min-width:0"
+                     placeholder="any model id — e.g. deepseek/deepseek-v4.1-flash-1017" spellcheck="false" />
+              <button class="btn" id="deepseekUseModel" title="use this model id for the deepseek provider">use</button>
+            </span>
+          </div>
+          <div id="deepseekKeyHint" style="margin-bottom:10px;color:var(--ink-mute);font-size:10px"></div>
+        </div>
+        <div style="margin-bottom:10px;color:var(--ink-mute);font-size:10px;line-height:1.5">
+          // the key is saved on this machine only (~/.browy/data/prefs.json), sent nowhere but the model's API.<br/>
+          // leave the key field empty to keep the saved one. models with a vendor prefix (deepseek/…) run via openrouter.
+        </div>
+        <div class="actions">
+          <button class="btn primary" id="providerSave">save provider</button>
+          <span id="providerState" style="color:var(--ink-mute);font-size:10px;align-self:center"></span>
+        </div>
+      </div>
+    </section>
+
+    <section>
+      <div class="sec-hdr">
         <h2>Model</h2>
-        <span class="sec-hint">// pick the LLM that powers Browy</span>
+        <span class="sec-hint">// pick the LLM that powers ShinScan</span>
       </div>
       <div class="sec-body">
         <div class="toolbar">

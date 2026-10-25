@@ -32,6 +32,15 @@ const toolGroupsEl = $('toolGroups');
 const toolSearchEl = $('toolSearch');
 const toolCountEl  = $('toolCount');
 const toolEnableAllEl = $('toolEnableAll');
+const providerSelect  = $('providerSelect');
+const deepseekFields  = $('deepseekFields');
+const deepseekKey     = $('deepseekKey');
+const deepseekModel   = $('deepseekModel');
+const deepseekCustomModel = $('deepseekCustomModel');
+const deepseekUseModel    = $('deepseekUseModel');
+const deepseekKeyHint     = $('deepseekKeyHint');
+const providerSave    = $('providerSave');
+const providerState   = $('providerState');
 
 let port = null;
 let allModels = [];
@@ -124,8 +133,8 @@ function connect() {
 }
 
 function send(msg) {
-  if (!port) return;
-  try { port.postMessage(msg); } catch {}
+  if (!port) return false;
+  try { port.postMessage(msg); return true; } catch { return false; }
 }
 
 // ── Install-backend section wiring (visible only when host is offline) ───
@@ -168,16 +177,19 @@ function onMsg(m) {
       // Hosts before protocol 2 all report a meaningless '0.3.0'.
       const current = m.protocol >= 2; // MIN_HOST_PROTOCOL in sidepanel.js
       verLabel.textContent = current ? 'v' + m.serverVersion : 'backend outdated';
-      verLabel.title = current ? '' : 'Your Browy backend is older than this extension. Re-run the installer to update it: https://browyhq.github.io/install/';
+      verLabel.title = current ? '' : 'Your ShinScan backend is older than this extension. Re-run the installer to update it: https://browyhq.github.io/install/';
     }
     // Open a session so pushInitialState fires.
     send({ type: 'session.start', sessionId: SESSION_ID, capabilities: [] });
     // And ask explicitly in case we missed the initial push.
     send({ type: 'models.list' });
+    // Which backend is live (copilot or deepseek), so the provider section
+    // reflects the host's saved state rather than a stale local copy.
+    send({ type: 'config.get' });
     return;
   }
   if (m.type === '__host_disconnected' || m.type === '__host_error' || m.type === '__host_missing' || m.type === '__host_stale') {
-    setHost('offline — make sure the browy backend is installed and running', 'err');
+    setHost('offline — make sure the shinscan backend is installed and running', 'err');
     return;
   }
 
@@ -208,7 +220,123 @@ function onMsg(m) {
     setAuth('unauth', m.message);
     return;
   }
+  if (m.type === 'config.current') {
+    applyConfigCurrent(m);
+    return;
+  }
 }
+
+// ── LLM provider (copilot | deepseek) ─────────────────────────────────────
+// Model ids with a vendor prefix (deepseek/deepseek-v4.1-flash-1017) are
+// OpenRouter ids — they route through openrouter.ai and need an OpenRouter
+// key. Plain ids (deepseek-chat, deepseek-reasoner) hit DeepSeek's own API
+// with a DeepSeek key. Same rule as isOpenRouterModel in src/agent/deepseek.ts.
+const isOpenRouterModel = (id) => typeof id === 'string' && id.includes('/');
+
+function currentDeepSeekModel() {
+  const custom = (deepseekCustomModel.value || '').trim();
+  return custom || deepseekModel.value || '';
+}
+
+function updateDeepSeekKeyHint() {
+  const id = currentDeepSeekModel();
+  if (isOpenRouterModel(id)) {
+    deepseekKeyHint.innerHTML = '// ' + id + ' runs via openrouter — paste your ' +
+      '<a href="https://openrouter.ai/keys" target="_blank" rel="noopener" style="color:var(--lime);text-decoration:underline">openrouter key</a> (sk-or-…).';
+  } else {
+    deepseekKeyHint.innerHTML = '// ' + (id || 'deepseek') + ' runs on deepseek\'s own api — paste your ' +
+      '<a href="https://platform.deepseek.com" target="_blank" rel="noopener" style="color:var(--lime);text-decoration:underline">deepseek key</a>.';
+  }
+}
+
+/** The host's model list and this dropdown can both carry ids the <select>
+ *  doesn't ship (custom model ids) — add them so value assignment sticks. */
+function ensureModelOption(id) {
+  if (!id) return;
+  if (![...deepseekModel.options].some((o) => o.value === id)) {
+    const opt = document.createElement('option');
+    opt.value = id;
+    opt.textContent = id + (isOpenRouterModel(id) ? ' — via openrouter' : '');
+    deepseekModel.appendChild(opt);
+  }
+}
+
+function applyConfigCurrent(m) {
+  const isDeepSeek = m.provider === 'deepseek';
+  providerSelect.value = isDeepSeek ? 'deepseek' : 'copilot';
+  deepseekFields.style.display = isDeepSeek ? '' : 'none';
+  if (isDeepSeek && m.model) {
+    ensureModelOption(m.model);
+    deepseekModel.value = m.model;
+  }
+  providerState.textContent = isDeepSeek
+    ? (m.apiKeySet ? 'api key saved on this machine' : 'no api key yet — paste it above')
+    : 'using github copilot credentials';
+  if (isDeepSeek) {
+    deepseekKey.placeholder = m.apiKeySet ? 'key saved — type a new one to replace it' : 'sk-…';
+  }
+  updateDeepSeekKeyHint();
+  // Remember locally so the section still prefills while the host is offline.
+  chrome.storage.local.get(['settings']).then(({ settings }) => {
+    const next = { ...(settings || {}), llm: { provider: m.provider, model: m.model, apiKeySet: m.apiKeySet } };
+    return chrome.storage.local.set({ settings: next });
+  }).catch(() => {});
+}
+
+providerSelect.addEventListener('change', () => {
+  deepseekFields.style.display = providerSelect.value === 'deepseek' ? '' : 'none';
+  updateDeepSeekKeyHint();
+});
+deepseekModel.addEventListener('change', updateDeepSeekKeyHint);
+deepseekCustomModel.addEventListener('input', updateDeepSeekKeyHint);
+
+deepseekUseModel.addEventListener('click', () => {
+  const id = (deepseekCustomModel.value || '').trim();
+  if (!id) {
+    showToast('type a model id first', 'err');
+    return;
+  }
+  if (!send({ type: 'models.set', id })) {
+    showToast('backend offline — cannot switch model', 'err');
+    return;
+  }
+  ensureModelOption(id);
+  deepseekModel.value = id;
+  updateDeepSeekKeyHint();
+  showToast(`model → ${id}`);
+});
+
+providerSave.addEventListener('click', () => {
+  const provider = providerSelect.value;
+  const patch = { type: 'config.set', provider };
+  if (provider === 'deepseek') {
+    patch.model = deepseekModel.value;
+    const key = deepseekKey.value.trim();
+    // Empty field = keep the saved key; the host merges the patch.
+    if (key) patch.apiKey = key;
+  }
+  if (!send(patch)) {
+    showToast('backend offline — cannot save', 'err');
+    return;
+  }
+  deepseekKey.value = '';
+  providerState.textContent = 'saving…';
+  showToast(provider === 'deepseek' ? 'provider → deepseek' : 'provider → github copilot');
+});
+
+// Prefill from the local copy while the host is still connecting; the host's
+// config.current (authoritative) overwrites this as soon as it lands.
+chrome.storage.local.get(['settings']).then(({ settings }) => {
+  const llm = settings && settings.llm;
+  if (!llm || !llm.provider) return;
+  providerSelect.value = llm.provider === 'deepseek' ? 'deepseek' : 'copilot';
+  deepseekFields.style.display = llm.provider === 'deepseek' ? '' : 'none';
+  if (llm.model) {
+    ensureModelOption(llm.model);
+    deepseekModel.value = llm.model;
+  }
+  updateDeepSeekKeyHint();
+}).catch(() => {});
 
 // ── Render ────────────────────────────────────────────────────────────────
 function setHost(label, dotClass) {

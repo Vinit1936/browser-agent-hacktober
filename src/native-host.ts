@@ -214,63 +214,88 @@ async function main() {
   }
 
   const transport = new NativeMessagingTransport();
+  // Provider-aware auth: with DeepSeek the pasted API key IS the credential.
+  // The probe reads the same config object the Agent mutates on config.set,
+  // so it tracks a runtime provider switch for free.
+  const providerAuthProbe = (): 'ready' | 'unauth' | 'unknown' =>
+    config.provider === 'deepseek'
+      ? (config.apiKey ? 'ready' : 'unauth')
+      : probeCopilotAuth();
   const runner = new Runner(agent, {
     serverVersion: SERVER_VERSION,
-    authProbe: probeCopilotAuth,
+    authProbe: providerAuthProbe,
     authSignin: openCopilotSignInTerminal,
   });
 
-  // Kick off Copilot init BEFORE attaching the transport. The panel sends
-  // `session.start` the instant the port connects, which triggers
-  // pushInitialState → listModels(). If `copilotReady` isn't set yet,
-  // whenCopilotReady() is a no-op and listModels returns []. The UI then
-  // shows an empty model list / no auth info until the first chat send
-  // (which awaits init properly). Setting the promise first guarantees
-  // every consumer waits for real data.
-  const initPromise = agent.initCopilot()
-    .then(() => {
-      log('copilot SDK initialised');
-      runner.notifyAuth('ready');
-      // Tell every attached panel the SDK is actually usable now. Until this
-      // lands, chat.list and models.list both come back empty, which the UI
-      // would otherwise render as "no past chats yet".
-      try { runner.markSdkReady(true); } catch {}
-      // Broadcast models to any panel that attached before init finished.
-      // Their initial pushInitialState already returned [] because they
-      // beat the init; this gives them a real list without a refresh.
-      agent.listModels().then((models) => {
-        try { runner.broadcast({ type: 'models.list', models }); } catch {}
-        try { runner.broadcast({ type: 'models.current', id: agent.getModel() }); } catch {}
-      }).catch(() => {});
-    })
-    .catch((e) => {
-      const m = e instanceof Error ? e.message : String(e);
-      log('copilot init failed:', m);
-      try { runner.markSdkReady(false, m); } catch {}
-      runner.notifyAuth('unauth', m);
-    });
-
+  // Attach the transport BEFORE the provider branch — every mode serves the
+  // extension. (There was a bug where attach lived inside the Copilot-only
+  // branch: with provider=deepseek the host started and logged ready but
+  // never answered `hello`, so the panel sat on "connecting…" forever, and
+  // nothing noticed the port closing either.)
   runner.attach(transport);
   transport.onClose(() => {
     log('transport closed; exiting');
     agent.disconnect().finally(() => process.exit(0));
   });
 
-  // NOTE: we deliberately do NOT call agent.connect() here.
-  //
-  // Phase E landed: the extension owns the browser via chrome.debugger and
-  // routes CDP through ExtensionContext, so the host never needs a playwright
-  // connection of its own. Calling connect() anyway meant every host start
-  // fired three parallel chromium.connectOverCDP attempts (1.5s timeout each)
-  // plus a fallback — all guaranteed to fail in the normal extension flow —
-  // and, on the rare occasion one succeeded, started a 2s setInterval
-  // rediscovery loop that kept the host's event loop hot for its whole life.
-  // Agent.connect() remains available for any future playwright-driven
-  // frontend; no current entry point calls it.
+  if (config.provider === 'deepseek') {
+    // DeepSeek mode talks straight to the model's API; booting the Copilot
+    // CLI here would only start a subprocess nobody uses (and fail on a
+    // machine that never signed in). Mark the SDK slot ready so panels fetch
+    // the DeepSeek model list, and report auth from the key.
+    log('provider=deepseek; skipping Copilot SDK init');
+    runner.markSdkReady(true);
+    runner.notifyAuth(
+      config.apiKey ? 'ready' : 'unauth',
+      config.apiKey ? 'deepseek api key configured' : 'no deepseek api key yet — add it in browy settings',
+    );
+  } else {
+    // Kick off Copilot init BEFORE the first client message. The panel sends
+    // `session.start` the instant the port connects, which triggers
+    // pushInitialState → listModels(). If `copilotReady` isn't set yet,
+    // whenCopilotReady() is a no-op and listModels returns []. The UI then
+    // shows an empty model list / no auth info until the first chat send
+    // (which awaits init properly). Setting the promise first guarantees
+    // every consumer waits for real data.
+    const initPromise = agent.initCopilot()
+      .then(() => {
+        log('copilot SDK initialised');
+        runner.notifyAuth('ready');
+        // Tell every attached panel the SDK is actually usable now. Until this
+        // lands, chat.list and models.list both come back empty, which the UI
+        // would otherwise render as "no past chats yet".
+        try { runner.markSdkReady(true); } catch {}
+        // Broadcast models to any panel that attached before init finished.
+        // Their initial pushInitialState already returned [] because they
+        // beat the init; this gives them a real list without a refresh.
+        agent.listModels().then((models) => {
+          try { runner.broadcast({ type: 'models.list', models }); } catch {}
+          try { runner.broadcast({ type: 'models.current', id: agent.getModel() }); } catch {}
+        }).catch(() => {});
+      })
+      .catch((e) => {
+        const m = e instanceof Error ? e.message : String(e);
+        log('copilot init failed:', m);
+        try { runner.markSdkReady(false, m); } catch {}
+        runner.notifyAuth('unauth', m);
+      });
 
-  // Wait for init to settle so the "ready" log line is meaningful, but we
-  // already triggered it above so the runner can serve clients in parallel.
-  await initPromise;
+    // NOTE: we deliberately do NOT call agent.connect() here.
+    //
+    // Phase E landed: the extension owns the browser via chrome.debugger and
+    // routes CDP through ExtensionContext, so the host never needs a playwright
+    // connection of its own. Calling connect() anyway meant every host start
+    // fired three parallel chromium.connectOverCDP attempts (1.5s timeout each)
+    // plus a fallback — all guaranteed to fail in the normal extension flow —
+    // and, on the rare occasion one succeeded, started a 2s setInterval
+    // rediscovery loop that kept the host's event loop hot for its whole life.
+    // Agent.connect() remains available for any future playwright-driven
+    // frontend; no current entry point calls it.
+
+    // Wait for init to settle so the "ready" log line is meaningful, but we
+    // already triggered it above so the runner can serve clients in parallel.
+    await initPromise;
+  }
 
   log('ready');
 }

@@ -324,7 +324,7 @@ async function cmdCopy() {
 
 function cmdVersion() {
   const m = chrome.runtime.getManifest();
-  appendRow('info', '→', 'browy ' + m.version);
+  appendRow('info', '→', 'shinscan ' + m.version);
   appendRow('dim', '·', 'model: ' + (sessionModel || '—'));
 }
 
@@ -406,7 +406,7 @@ function cmdExport() {
     const url = URL.createObjectURL(blob);
     const ts = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
     const a = document.createElement('a');
-    a.href = url; a.download = 'browy-cli-' + ts + '.txt';
+    a.href = url; a.download = 'shinscan-cli-' + ts + '.txt';
     document.body.appendChild(a); a.click(); a.remove();
     setTimeout(() => URL.revokeObjectURL(url), 1000);
     appendRow('ok', '✓', 'exported ' + lines.length + ' line' + (lines.length === 1 ? '' : 's'));
@@ -555,7 +555,7 @@ port.onMessage.addListener((msg) => {
         // Hosts before protocol 2 all report a meaningless '0.3.0'.
         appendRow('dim', '·', 'host ready' + (current && msg.serverVersion ? ' v' + msg.serverVersion : ''));
         if (!current) {
-          appendRow('warn', '!', 'browy backend is out of date, so newer features (like deleting chats) won\'t work. re-run the installer to update it:');
+          appendRow('warn', '!', 'shinscan backend is out of date, so newer features (like deleting chats) won\'t work. re-run the installer to update it:');
           appendRow('dim', ' ', INSTALL_CMD);
         }
         // Wait for the persisted id so we resume the previous DevTools chat
@@ -580,7 +580,7 @@ port.onMessage.addListener((msg) => {
     case '__host_missing':
       if (lastHostNotice !== 'missing') {
         lastHostNotice = 'missing';
-        appendRow('err', '✗', 'browy backend not installed. install it, then reopen devtools: ' + INSTALL_CMD);
+        appendRow('err', '✗', 'shinscan backend not installed. install it, then reopen devtools: ' + INSTALL_CMD);
       }
       hostReady = false;
       sessionStarted = false;
@@ -589,7 +589,7 @@ port.onMessage.addListener((msg) => {
     case '__host_stale':
       if (lastHostNotice !== 'stale') {
         lastHostNotice = 'stale';
-        appendRow('err', '✗', 'browy backend is too old for this extension. update it, then reopen devtools: ' + INSTALL_CMD);
+        appendRow('err', '✗', 'shinscan backend is too old for this extension. update it, then reopen devtools: ' + INSTALL_CMD);
       }
       hostReady = false;
       sessionStarted = false;
@@ -628,7 +628,7 @@ port.onMessage.addListener((msg) => {
       break;
 
     case 'chat.queued':
-      appendRow('dim', '·', 'browy is busy in another panel · this runs when that finishes');
+      appendRow('dim', '·', 'shinscan is busy in another panel · this runs when that finishes');
       break;
 
     case 'chat.error':
@@ -931,7 +931,7 @@ chrome.devtools.network.onNavigated.addListener(() => {
 // ── Boot ─────────────────────────────────────────────────────────────────
 
 (function boot() {
-  appendRow('banner', '~', 'Browy CLI — type /help for commands');
+  appendRow('banner', '~', 'ShinScan CLI — type /help for commands');
   refreshPageMeta();
   $cmd.focus();
 })();

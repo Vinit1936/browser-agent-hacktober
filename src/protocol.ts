@@ -194,6 +194,33 @@ export interface ChatDelete {
   id: string;
 }
 
+/** Switch the agent's LLM backend, sent by the extension Settings page.
+ *  `provider: 'deepseek'` runs the agent directly against DeepSeek's
+ *  chat-completions API with the pasted key; 'copilot' restores the default
+ *  GitHub Copilot backend. Omitted fields keep their current value. The
+ *  choice persists in prefs.json, so it survives host restarts. */
+export interface ConfigSet {
+  type: 'config.set';
+  provider?: 'deepseek' | 'copilot';
+  /** DeepSeek API key ("sk-…"). Omit or leave empty to keep the saved one. */
+  apiKey?: string;
+  model?: string;
+}
+
+/** Ask for the current backend config. Answered with `config.current`; the
+ *  API key itself never travels back, only whether one is set. */
+export interface ConfigGet {
+  type: 'config.get';
+}
+
+export interface ConfigCurrent {
+  type: 'config.current';
+  /** 'deepseek', or the Copilot-side provider id (azure/openai/anthropic). */
+  provider: string;
+  model: string;
+  apiKeySet: boolean;
+}
+
 export type ClientMessage =
   | ClientHello
   | SessionStart
@@ -209,7 +236,9 @@ export type ClientMessage =
   | SetModel
   | ChatList
   | ChatHistory
-  | ChatDelete;
+  | ChatDelete
+  | ConfigSet
+  | ConfigGet;
 
 // ── Server → Client ────────────────────────────────────────────────────────
 
@@ -491,7 +520,8 @@ export type ServerMessage =
   | FocusedTab
   | ChatListResult
   | ChatHistoryResult
-  | ChatDeleteResult;
+  | ChatDeleteResult
+  | ConfigCurrent;
 
 // ── Transport interface ────────────────────────────────────────────────────
 //

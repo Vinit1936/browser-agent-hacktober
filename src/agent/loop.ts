@@ -8,10 +8,11 @@ import path from 'path';
 import { getForegroundInfo, brandFromProcessName, stripBrowserSuffix, shutdownForeground } from './foreground.js';
 import { copilotClientOptions, resolveCopilotCli } from './copilot-cli.js';
 import { RecentActions } from './recent-actions.js';
-import { OPT_IN_TOOLS, toolPolicy } from './tool-policy.js';
+import { BROWY_OPT_IN_TOOLS, OPT_IN_TOOLS, toolPolicy } from './tool-policy.js';
 import { TurnText } from './turn-text.js';
 import type { WakeWatch } from './wake-watch.js';
 import { eventsToTurns, pageTurns, legacyMessages, type ChatItem, type ChatPage, type LegacyMessage } from './chat-items.js';
+import { streamDeepSeekChat, deepseekModelOptions, type DeepSeekToolCall } from './deepseek.js';
 
 // Copilot SDK is CJS — use require
 import { createRequire } from 'module';
@@ -276,6 +277,13 @@ const TOOL_DEADLINE_MS = Number(process.env.BROWY_TOOL_DEADLINE_MS) || 2 * 60 * 
  *  leaves room. BROWY_IDLE_MS shortens it for tests. */
 const IDLE_MS = Number(process.env.BROWY_IDLE_MS) || 5 * 60 * 1000;
 
+/** Cap on tool-call rounds within one DeepSeek turn, as a runaway guard —
+ *  the model gets the failure back and the turn ends with an explanation. */
+const DEEPSEEK_MAX_HOPS = 32;
+/** Cap on messages sent to DeepSeek per request (system prompt + newest N).
+ *  The Copilot SDK trims its own history; this is the DeepSeek equivalent. */
+const DEEPSEEK_MAX_MESSAGES = 160;
+
 /** A span of time the way the user reads it. */
 function spanText(ms: number): string {
   const n = ms >= 60_000 ? Math.round(ms / 60_000) : Math.round(ms / 1000);
@@ -394,6 +402,11 @@ export class Agent {
   /** Chats whose last turn was cut short, and why. Their next turn tells the
    *  model (MODEL_NOTES). */
   private interruptedChats = new Map<string, InterruptReason>();
+  /** In-memory conversation per chat for the DeepSeek backend (deepseek.ts).
+   *  The Copilot SDK persists its sessions on disk; this map is the DeepSeek
+   *  equivalent and is deliberately process-local: a provider switch, a
+   *  history.clear or a host restart starts the chat fresh. */
+  private deepseekMessages = new Map<string, unknown[]>();
 
   constructor(config: Config) {
     this.config = config;
@@ -1076,7 +1089,68 @@ export class Agent {
     return { text, toolCalls: [], stopped: true, interrupted: ctl.interrupted };
   }
 
+  /** The user's message wrapped in the live browser context, indexed snapshot,
+   *  recent-actions trace and any cut-short note — the exact prompt both the
+   *  Copilot and the DeepSeek turn send. Shared so the two backends always see
+   *  the same page state. `step` is the caller's Stop-aware deadline wrapper,
+   *  so a slow tab can't hold either backend hostage. */
+  private async buildTurnPrompt(
+    userText: string,
+    step: <T>(what: string, p: Promise<T>, ms: number, fallback: T) => Promise<T>,
+  ): Promise<string> {
+    // Inject live browser context so the agent always knows what tab is
+    // focused without needing a tool call. This dramatically reduces
+    // round-trips for "summarize this page", "what am I looking at", etc.
+    const ctx = this.currentTabInfo;
+    const cdpForCtx = this.getCdpForContext();
+    const extras = await step('reading the page', this.captureLiveContext(cdpForCtx), 5_000, {});
+    const contextLines: string[] = [];
+    if (ctx.url) {
+      contextLines.push(`Browser:    ${ctx.brand}`);
+      contextLines.push(`Active tab: ${JSON.stringify(ctx.title || 'untitled')}`);
+      contextLines.push(`URL:        ${ctx.url}`);
+      contextLines.push(`Open tabs:  ${ctx.tabCount}`);
+      if (extras.viewport) contextLines.push(`Viewport:   ${extras.viewport}`);
+      if (extras.scroll)   contextLines.push(`Scroll:     ${extras.scroll}`);
+      if (extras.readyState) contextLines.push(`Ready:      ${extras.readyState}`);
+      if (extras.selectionPreview) contextLines.push(`Selection:  ${extras.selectionPreview}`);
+    }
+
+    // Indexed snapshot — the agent's "eyes". One CDP eval; tags interactive
+    // elements with data-browy-id so click_index/type_index can resolve.
+    // Skipped on chrome:// and similar non-DOM tabs.
+    let snapshotBlock = '';
+    const url = ctx.url || '';
+    const isInteractivePage = url && !/^(chrome|edge|brave|about|chrome-extension):/i.test(url);
+    if (cdpForCtx && isInteractivePage) {
+      // always fresh on user turn
+      const snap = await step('snapshotting the page', ensureSnapshot(cdpForCtx, 0).catch(() => null), 10_000, null);
+      if (snap) snapshotBlock = `\n<page_snapshot>\n${serializeSnapshot(snap)}\n</page_snapshot>`;
+      // else fail-soft: agent can still call inspect_page
+    }
+
+    const recentBlock = this.serializeRecentActions();
+    const contextBlock = contextLines.length
+      ? `<browser_context>\n${contextLines.join('\n')}\n</browser_context>${snapshotBlock}\n${recentBlock}\n`
+      : recentBlock ? `${recentBlock}\n` : '';
+    // The last turn in this chat was cut short: say so once, so "continue"
+    // checks before it repeats anything.
+    const chatKey = this.chatKey();
+    const cutShort = this.interruptedChats.get(chatKey);
+    if (cutShort) this.interruptedChats.delete(chatKey);
+    const noteBlock = cutShort ? `<browy_note>\n${MODEL_NOTES[cutShort]} ${MODEL_NOTE_CAUTION}\n</browy_note>\n` : '';
+    // Put the user's actual text FIRST so the SDK's session-summary (which
+    // truncates to ~100 chars) captures the user's intent rather than our
+    // injected scaffolding. The model sees the same content either way.
+    return contextBlock || noteBlock
+      ? `${userText}\n\n${contextBlock}${noteBlock}`
+      : userText;
+  }
+
   async chat(userText: string): Promise<ChatResult> {
+    // DeepSeek mode drives the tools directly over the chat-completions API;
+    // the Copilot SDK below never runs with a user-supplied DeepSeek key.
+    if (this.config.provider === 'deepseek') return this.chatDeepSeek(userText);
     // Registered before the first await, so a Stop that lands while the turn
     // is still being set up is not lost.
     let halt: () => void = () => {};
@@ -1156,53 +1230,7 @@ export class Agent {
 
       this.emit({ type: 'activity', event: 'llm_call_start' });
       const t0 = Date.now();
-
-      // Inject live browser context so the agent always knows what tab is
-      // focused without needing a tool call. This dramatically reduces
-      // round-trips for "summarize this page", "what am I looking at", etc.
-      const ctx = this.currentTabInfo;
-      const cdpForCtx = this.getCdpForContext();
-      const extras = await step('reading the page', this.captureLiveContext(cdpForCtx), 5_000, {});
-      const contextLines: string[] = [];
-      if (ctx.url) {
-        contextLines.push(`Browser:    ${ctx.brand}`);
-        contextLines.push(`Active tab: ${JSON.stringify(ctx.title || 'untitled')}`);
-        contextLines.push(`URL:        ${ctx.url}`);
-        contextLines.push(`Open tabs:  ${ctx.tabCount}`);
-        if (extras.viewport) contextLines.push(`Viewport:   ${extras.viewport}`);
-        if (extras.scroll)   contextLines.push(`Scroll:     ${extras.scroll}`);
-        if (extras.readyState) contextLines.push(`Ready:      ${extras.readyState}`);
-        if (extras.selectionPreview) contextLines.push(`Selection:  ${extras.selectionPreview}`);
-      }
-
-      // Indexed snapshot — the agent's "eyes". One CDP eval; tags interactive
-      // elements with data-browy-id so click_index/type_index can resolve.
-      // Skipped on chrome:// and similar non-DOM tabs.
-      let snapshotBlock = '';
-      const url = ctx.url || '';
-      const isInteractivePage = url && !/^(chrome|edge|brave|about|chrome-extension):/i.test(url);
-      if (cdpForCtx && isInteractivePage) {
-        // always fresh on user turn
-        const snap = await step('snapshotting the page', ensureSnapshot(cdpForCtx, 0).catch(() => null), 10_000, null);
-        if (snap) snapshotBlock = `\n<page_snapshot>\n${serializeSnapshot(snap)}\n</page_snapshot>`;
-        // else fail-soft: agent can still call inspect_page
-      }
-
-      const recentBlock = this.serializeRecentActions();
-      const contextBlock = contextLines.length
-        ? `<browser_context>\n${contextLines.join('\n')}\n</browser_context>${snapshotBlock}\n${recentBlock}\n`
-        : recentBlock ? `${recentBlock}\n` : '';
-      // The last turn in this chat was cut short: say so once, so "continue"
-      // checks before it repeats anything.
-      const cutShort = this.interruptedChats.get(chatKey);
-      if (cutShort) this.interruptedChats.delete(chatKey);
-      const noteBlock = cutShort ? `<browy_note>\n${MODEL_NOTES[cutShort]} ${MODEL_NOTE_CAUTION}\n</browy_note>\n` : '';
-      // Put the user's actual text FIRST so the SDK's session-summary (which
-      // truncates to ~100 chars) captures the user's intent rather than our
-      // injected scaffolding. The model sees the same content either way.
-      const prompt = contextBlock || noteBlock
-        ? `${userText}\n\n${contextBlock}${noteBlock}`
-        : userText;
+      const prompt = await this.buildTurnPrompt(userText, step);
 
       // ── Stream-based send ────────────────────────────────────────────
       // sendAndWait() has a hard 60s timeout that breaks multi-step tool
@@ -1403,6 +1431,233 @@ export class Agent {
     }
   }
 
+  // ── DeepSeek backend (provider 'deepseek') ────────────────────────────────
+  //
+  // The Copilot SDK can't use a user-supplied DeepSeek key, so this path
+  // drives the same browser tools directly against DeepSeek's
+  // chat-completions API: stream a reply, execute the tool calls it asks
+  // for, feed the results back, until the model answers without tool calls.
+
+  /** In-memory history for the DeepSeek backend, per chat. */
+  private deepseekHistory(): unknown[] {
+    const key = this.chatKey();
+    let h = this.deepseekMessages.get(key);
+    if (!h) {
+      h = [{ role: 'system', content: SYSTEM_PROMPT }];
+      this.deepseekMessages.set(key, h);
+    }
+    return h;
+  }
+
+  /** Chat-completions tool definitions for this turn: every browser tool the
+   *  user hasn't disabled, minus opt-in tools they haven't switched on. Also
+   *  (re)registers the tool handlers — the same handlers the Copilot path
+   *  dispatches to — so both backends share one tool implementation. */
+  private buildDeepSeekToolDefs(): unknown[] {
+    this.buildCopilotTools(this.getBrowserContext());
+    return getAllTools()
+      .filter((t) =>
+        !this.disabledTools.has(t.def.name) &&
+        (!BROWY_OPT_IN_TOOLS.has(t.def.name) || this.enabledHostTools.has(t.def.name)))
+      .map((t) => ({
+        type: 'function',
+        function: { name: t.def.name, description: t.def.description, parameters: t.def.parameters },
+      }));
+  }
+
+  /** Run one tool call with the same two-minute deadline the Copilot path
+   *  gives its tools. Returns the tool-role content, or a failure the model
+   *  can read and recover from. */
+  private async runDeepSeekTool(call: DeepSeekToolCall): Promise<ToolAnswer> {
+    let args: Record<string, unknown> = {};
+    if (call.arguments && call.arguments.trim()) {
+      try {
+        args = JSON.parse(call.arguments);
+      } catch (e) {
+        return toolFailure(`${call.name} was called with invalid JSON arguments: ${(e instanceof Error ? e.message : String(e)).slice(0, 200)}`);
+      }
+      if (!args || typeof args !== 'object' || Array.isArray(args)) {
+        return toolFailure(`${call.name} arguments must be a JSON object, got: ${call.arguments.slice(0, 100)}`);
+      }
+    }
+    const handler = this.toolHandlersByName.get(call.name);
+    if (!handler) return toolFailure(`Unknown tool: ${call.name}. Use one of the tools in this conversation.`);
+    let timer: NodeJS.Timeout | undefined;
+    try {
+      return await Promise.race([
+        handler(args, { requestId: call.id }),
+        new Promise<ToolAnswer>((resolve) => {
+          timer = setTimeout(() => {
+            // The handler's late result must not overwrite the timeout on the
+            // panel (abandonedTools) or in the recent-actions trace.
+            this.abandonedTools.add(call.id);
+            const limit = TOOL_DEADLINE_MS >= 60_000 ? `${Math.round(TOOL_DEADLINE_MS / 60_000)} minutes` : `${Math.round(TOOL_DEADLINE_MS / 1000)} seconds`;
+            const message = `${call.name} got no answer within ${limit}, so Browy gave up on it. `
+              + 'The tab may be busy, frozen or showing a dialog. Try again, or switch to the tab first.';
+            this.emit({ type: 'tool_step', id: this.toolSteps.get(call.id) || `${call.name}-${call.id}`, name: call.name, status: 'error', result: message, durationMs: TOOL_DEADLINE_MS });
+            this.recordRecentAction(call.name, args, message, false, TOOL_DEADLINE_MS);
+            resolve(toolFailure(message, 'timeout'));
+          }, TOOL_DEADLINE_MS);
+        }),
+      ]);
+    } catch (e) {
+      return toolFailure(e instanceof Error ? e.message : String(e));
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
+  }
+
+  /** The DeepSeek agent loop: request → (tool calls → results)* → reply.
+   *  Streams deltas out as they arrive and returns everything the model said
+   *  across the turn, like the Copilot path's TurnText accumulator does. */
+  private async runDeepSeekTurn(
+    prompt: string,
+    tools: unknown[],
+    ctl: TurnControl,
+    halted: Promise<void>,
+  ): Promise<string> {
+    const history = this.deepseekHistory();
+    // Keep the system prompt plus the newest DEEPSEEK_MAX_MESSAGES messages.
+    if (history.length > DEEPSEEK_MAX_MESSAGES + 1) {
+      history.splice(1, history.length - DEEPSEEK_MAX_MESSAGES - 1);
+    }
+    history.push({ role: 'user', content: prompt });
+
+    let turnText = '';
+    for (let hop = 0; hop < DEEPSEEK_MAX_HOPS; hop++) {
+      if (ctl.stopped) return turnText;
+      const ac = new AbortController();
+      const stopStream = () => { ctl.stopped = true; ac.abort(); };
+      ctl.stop = stopStream;
+      void halted.then(stopStream, () => {});
+      let res;
+      try {
+        res = await streamDeepSeekChat({
+          apiKey: this.config.apiKey,
+          model: this.config.model,
+          messages: history,
+          tools,
+          maxTokens: this.config.maxOutputTokens,
+          signal: ac.signal,
+          onText: (chunk) => {
+            turnText += chunk;
+            this.emit({ type: 'delta', text: chunk });
+          },
+          onReasoning: (chunk) => this.emit({ type: 'reasoning', text: chunk }),
+        });
+      } catch (e) {
+        if (ctl.stopped) return turnText; // Stop pressed mid-request
+        throw e;
+      }
+      if (ctl.stopped) return turnText;
+
+      if (res.toolCalls.length === 0) {
+        history.push({ role: 'assistant', content: res.content });
+        return turnText;
+      }
+
+      // reasoning_content is display-only and must NOT go back to the API.
+      history.push({
+        role: 'assistant',
+        content: res.content || null,
+        tool_calls: res.toolCalls.map((c) => ({
+          id: c.id, type: 'function', function: { name: c.name, arguments: c.arguments },
+        })),
+      });
+      this.emit({ type: 'status', status: 'tool_calling' });
+      for (const call of res.toolCalls) {
+        const answer = await this.runDeepSeekTool(call);
+        history.push({
+          role: 'tool',
+          tool_call_id: call.id,
+          content: typeof answer === 'string' ? answer : answer.textResultForLlm,
+        });
+      }
+      this.emit({ type: 'status', status: 'thinking' });
+    }
+    throw new Error(`DeepSeek was still calling tools after ${DEEPSEEK_MAX_HOPS} steps, so Browy stopped it. Send a message to carry on.`);
+  }
+
+  /** The DeepSeek turn — mirrors the Copilot chat() prelude and result
+   *  handling, swapping the SDK send for runDeepSeekTurn(). */
+  async chatDeepSeek(userText: string): Promise<ChatResult> {
+    let halt: () => void = () => {};
+    const halted = new Promise<void>((resolve) => { halt = resolve; });
+    const ctl: TurnControl = { stopped: false, stop: null, halt: () => halt() };
+    this.turn = ctl;
+    const chatKey = this.chatKey();
+    const stoppedResult = (): ChatResult => {
+      this.emit({ type: 'status', status: 'idle' });
+      return this.stoppedTurn(ctl, chatKey, turnText);
+    };
+    // Same deadline wrapper as the Copilot path: a setup step ends at once
+    // when Stop is pressed, and after `ms` the turn carries on. Errors still
+    // come through.
+    const step = async <T>(what: string, p: Promise<T>, ms: number, fallback: T): Promise<T> => {
+      let timer: NodeJS.Timeout | undefined;
+      try {
+        const r = await Promise.race([
+          p,
+          halted.then((): T => { throw STOPPED; }),
+          new Promise<T>((resolve) => {
+            timer = setTimeout(() => {
+              if (!this.wake?.check()) console.log(`  ⏱ ${what} took over ${ms / 1000} s`);
+              resolve(fallback);
+            }, ms);
+          }),
+        ]);
+        if (ctl.stopped) throw STOPPED;
+        return r;
+      } finally {
+        clearTimeout(timer);
+      }
+    };
+    let turnText = '';
+    try {
+      await step('finding the focused tab', this.detectFocusedTab(), 10_000, undefined);
+      await step('reading the tab', this.refreshTabInfo(), 10_000, undefined);
+      // Extension mode: pull tab info directly from the BrowserToolContext.
+      if (this.contextOverride?.getActiveTabInfo) {
+        const info = await step('reading the active tab', this.contextOverride.getActiveTabInfo().catch(() => null), 35_000, null);
+        if (info && info.url) {
+          this.currentTabInfo = {
+            url: info.url,
+            title: info.title || '',
+            brand: info.brand || 'Browser',
+            tabCount: info.tabCount || 1,
+          };
+        }
+      }
+    } catch (e) {
+      if (this.turn === ctl) this.turn = null;
+      if (e === STOPPED || ctl.interrupted) return stoppedResult();
+      throw e;
+    }
+    this.emit({ type: 'status', status: 'thinking' });
+
+    try {
+      if (!this.config.apiKey) {
+        throw new Error('No DeepSeek API key set. Open Browy Settings → LLM Provider, pick DeepSeek and paste your key.');
+      }
+      this.emit({ type: 'activity', event: 'llm_call_start' });
+      const t0 = Date.now();
+      const prompt = await this.buildTurnPrompt(userText, step);
+      const tools = this.buildDeepSeekToolDefs();
+      turnText = await this.runDeepSeekTurn(prompt, tools, ctl, halted);
+      this.emit({ type: 'activity', event: 'llm_call_end', durationMs: Date.now() - t0 });
+      this.emit({ type: 'status', status: 'idle' });
+      if (ctl.stopped) return this.stoppedTurn(ctl, chatKey, turnText);
+      return { text: turnText || 'No response', toolCalls: [] };
+    } catch (err) {
+      if (err === STOPPED || ctl.interrupted) return stoppedResult();
+      const errMsg = `${err instanceof Error ? err.message : String(err)}`;
+      this.emit({ type: 'status', status: 'error', detail: errMsg });
+      return { text: `Error: ${errMsg}`, toolCalls: [] };
+    } finally {
+      if (this.turn === ctl) this.turn = null;
+    }
+  }
+
   /** Run a tool request the SDK received but never dispatched, and answer the
    *  runtime directly (see the external_tool.requested case in chat()). The
    *  handle that dropped it is reopened before the next turn. */
@@ -1470,6 +1725,17 @@ export class Agent {
     return this.config.model;
   }
 
+  /** Active backend id — 'deepseek', or the Copilot-side provider. */
+  getProvider(): string {
+    return this.config.provider;
+  }
+
+  /** Whether any API key is configured. For the DeepSeek provider this IS
+   *  the auth state; the Copilot side signs in instead. */
+  hasApiKey(): boolean {
+    return !!this.config.apiKey;
+  }
+
   /** Switch the Copilot model in-place when possible (preserving the session
    *  history), otherwise fall back to recreating the session.
    *  The Copilot SDK exposes `session.setModel(id)` since copilot-sdk 0.x; we
@@ -1500,8 +1766,59 @@ export class Agent {
     await this.clearHistory();
   }
 
+  /** Apply a backend switch from the Settings page (protocol config.set).
+   *  Only fields present in the patch change. Switching between Copilot and
+   *  DeepSeek tears down whichever session handle is open and drops the other
+   *  backend's in-memory history, so the next chat starts clean. The choice
+   *  is persisted to prefs.json (best-effort, like every pref write). */
+  async setLLMConfig(patch: { provider?: 'deepseek' | 'copilot'; apiKey?: string; model?: string }): Promise<void> {
+    if (patch.apiKey !== undefined && patch.apiKey !== null) {
+      this.config.apiKey = patch.apiKey.trim();
+    }
+    if (patch.provider === 'deepseek' && this.config.provider !== 'deepseek') {
+      // Leave the Copilot world: detach the session handle WITHOUT deleting
+      // the chats on disk, so switching back resumes them.
+      const old = this.copilotSession;
+      this.copilotSession = null;
+      if (old) {
+        Promise.resolve().then(async () => {
+          try { await old.abort(); } catch {}
+          try { await old.disconnect(); } catch {}
+        });
+      }
+      this.config.provider = 'deepseek';
+      this.config.model = patch.model || 'deepseek-chat';
+      this.deepseekMessages.clear();
+    } else if (patch.provider === 'copilot' && this.config.provider === 'deepseek') {
+      this.deepseekMessages.clear();
+      this.config.provider = (process.env.BA_PROVIDER as Config['provider']) || 'azure';
+      this.config.model = patch.model || process.env.BA_MODEL || 'claude-sonnet-4.5';
+      // The DeepSeek key must not leak into Copilot requests (azure sends it
+      // as api-key). Restore whatever the environment had at boot instead.
+      this.config.apiKey = process.env.BA_API_KEY || process.env.OPENAI_API_KEY
+        || process.env.ANTHROPIC_API_KEY || '';
+      // The DeepSeek path never boots the SDK; start it now. Failure here
+      // (typically "not signed in") propagates to the caller → auth banner.
+      await this.initCopilot();
+    } else if (patch.model) {
+      this.config.model = patch.model;
+    }
+    try {
+      const { savePrefs } = await import('./prefs.js');
+      if (this.config.provider === 'deepseek') {
+        savePrefs({ provider: 'deepseek', apiKey: this.config.apiKey || null, model: this.config.model });
+      } else {
+        // Leaving DeepSeek must scrub its provider + key from prefs.json.
+        savePrefs({ provider: null, apiKey: null, model: this.config.model });
+      }
+    } catch {}
+  }
+
   /** List models advertised by the Copilot SDK. */
   async listModels(): Promise<import('../types.js').ModelOption[]> {
+    // DeepSeek has a fixed catalogue; no SDK round-trip needed (and in
+    // deepseek mode the SDK may not be running at all).
+    if (this.config.provider === 'deepseek') return deepseekModelOptions();
     await this.whenCopilotReady();
     if (!this.copilotClient) return [];
     try {
@@ -1650,6 +1967,7 @@ export class Agent {
       try { await old.disconnect(); } catch {}
     }
     this.recentActions.clear(id);
+    this.deepseekMessages.delete(id);
     this.forgetChat(id);
     try {
       await this.copilotClient.deleteSession(id);
@@ -1909,6 +2227,7 @@ export class Agent {
     const id = old?.sessionId || this.browyProtocolSessionId;
     this.copilotSession = null;
     this.recentActions.clear(this.chatKey());
+    this.deepseekMessages.delete(this.chatKey());
     if (old) {
       try { await old.abort(); } catch {}
       try { await old.disconnect(); } catch {}

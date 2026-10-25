@@ -32,6 +32,9 @@ export function loadConfig(): Config {
   };
 
   const prefs = loadPrefs();
+  // "auto" is a leftover from an older fork's prefs schema — treat it (and
+  // anything empty) as unset so the provider default applies.
+  const prefModel = prefs.model && prefs.model !== 'auto' ? prefs.model : undefined;
   const cdpUrl = process.env.BA_CDP_URL || defaults.cdpUrl;
   const endpoints = parseEndpoints(process.env.BA_CDP_ENDPOINTS, defaults.cdpEndpoints);
   // Make sure the legacy single-url is in the endpoint list so behaviour is
@@ -41,11 +44,20 @@ export function loadConfig(): Config {
   }
 
   return {
-    provider: (process.env.BA_PROVIDER as Config['provider']) || defaults.provider,
+    // The Settings page can switch the backend to DeepSeek; BA_PROVIDER still
+    // wins for power users, and anything else in prefs falls back to default.
+    provider: (process.env.BA_PROVIDER as Config['provider'])
+      || (prefs.provider === 'deepseek' ? 'deepseek' : defaults.provider),
     endpoint: process.env.BA_ENDPOINT || defaults.endpoint,
-    apiKey: process.env.BA_API_KEY || process.env.OPENAI_API_KEY || process.env.ANTHROPIC_API_KEY || defaults.apiKey,
+    // Precedence: env > saved pref (the key pasted in Settings) > bundled default.
+    apiKey: process.env.BA_API_KEY
+      || process.env.DEEPSEEK_API_KEY
+      || process.env.OPENAI_API_KEY
+      || process.env.ANTHROPIC_API_KEY
+      || (prefs.provider === 'deepseek' ? prefs.apiKey : '')
+      || defaults.apiKey,
     // Precedence: env > saved pref (last user choice) > bundled default.
-    model: process.env.BA_MODEL || prefs.model || defaults.model,
+    model: process.env.BA_MODEL || prefModel || defaults.model,
     apiVersion: process.env.BA_API_VERSION || defaults.apiVersion,
     maxOutputTokens: parseInt(process.env.BA_MAX_TOKENS || '', 10) || defaults.maxOutputTokens,
     reasoningEffort: (process.env.BA_REASONING as Config['reasoningEffort']) || defaults.reasoningEffort,
